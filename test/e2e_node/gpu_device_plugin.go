@@ -84,23 +84,25 @@ var _ = framework.KubeDescribe("NVIDIA GPU Device Plugin [Feature:GPUDevicePlugi
 		It("checks that when Kubelet restarts exclusive GPU assignation to pods is kept.", func() {
 			By("Creating one GPU pod on a node with at least two GPUs")
 			p1 := f.PodClient().CreateSync(makeCudaPauseImage())
-			devId1 := getDeviceId(f, p1.Name, p1.Name, 1)
+			deviceRE := "gpu devices: (nvidia[0-9]+)"
+			devId1 := getDeviceIdWithRE(f, p1.Name, p1.Name, 1, deviceRE)
 			p1, err := f.PodClient().Get(p1.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 
 			By("Restarting Kubelet and waiting for the current running pod to restart")
-			restartKubelet(f)
+			socketRE := "/var/lib/kubelet/device-plugins/nvidiaGPU*.sock"
+			restartKubeletWithSocketRE(f, socketRE)
 
 			By("Confirming that after a kubelet and pod restart, GPU assignement is kept")
-			devIdRestart := getDeviceId(f, p1.Name, p1.Name, 2)
+			devIdRestart := getDeviceIdWithRE(f, p1.Name, p1.Name, 2, deviceRE)
 			Expect(devIdRestart).To(Equal(devId1))
 
 			By("Restarting Kubelet and creating another pod")
-			restartKubelet(f)
+			restartKubeletWithSocketRE(f, socketRE)
 			p2 := f.PodClient().CreateSync(makeCudaPauseImage())
 
 			By("Checking that pods got a different GPU")
-			devId2 := getDeviceId(f, p2.Name, p2.Name, 1)
+			devId2 := getDeviceIdWithRE(f, p2.Name, p2.Name, 1, deviceRE)
 			Expect(devId1).To(Not(Equal(devId2)))
 
 			// Cleanup
@@ -139,8 +141,8 @@ func newDecimalResourceList(name v1.ResourceName, quantity int64) v1.ResourceLis
 }
 
 // TODO: Find a uniform way to deal with systemctl/initctl/service operations. #34494
-func restartKubelet(f *framework.Framework) {
-	beforeSocks, err := filepath.Glob("/var/lib/kubelet/device-plugins/nvidiaGPU*.sock")
+func restartKubeletWithSocketRE(f *framework.Framework, re string) {
+	beforeSocks, err := filepath.Glob(re)
 	framework.ExpectNoError(err)
 	Expect(len(beforeSocks)).NotTo(BeZero())
 	stdout, err := exec.Command("sudo", "systemctl", "list-units", "kubelet*", "--state=running").CombinedOutput()
@@ -153,11 +155,11 @@ func restartKubelet(f *framework.Framework) {
 	stdout, err = exec.Command("sudo", "systemctl", "restart", kube).CombinedOutput()
 	framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
 	Eventually(func() ([]string, error) {
-		return filepath.Glob("/var/lib/kubelet/device-plugins/nvidiaGPU*.sock")
+		return filepath.Glob(re)
 	}, 5*time.Minute, framework.Poll).ShouldNot(ConsistOf(beforeSocks))
 }
 
-func getDeviceId(f *framework.Framework, podName string, contName string, restartCount int32) string {
+func getDeviceIdWithRE(f *framework.Framework, podName string, contName string, restartCount int32, re string) string {
 	// Wait till pod has been restarted at least restartCount times.
 	Eventually(func() bool {
 		p, err := f.PodClient().Get(podName, metav1.GetOptions{})
@@ -171,7 +173,7 @@ func getDeviceId(f *framework.Framework, podName string, contName string, restar
 		framework.Failf("GetPodLogs for pod %q failed: %v", podName, err)
 	}
 	framework.Logf("got pod logs: %v", logs)
-	regex := regexp.MustCompile("gpu devices: (nvidia[0-9]+)")
+	regex := regexp.MustCompile(re)
 	matches := regex.FindStringSubmatch(logs)
 	if len(matches) < 2 {
 		return ""
