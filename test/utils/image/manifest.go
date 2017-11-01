@@ -81,6 +81,7 @@ var (
 	ResourceController = ImageConfig{e2eRegistry, "resource-consumer/controller", "1.0"}
 	ServeHostname      = ImageConfig{e2eRegistry, "serve-hostname", "1.0"}
 	TestWebserver      = ImageConfig{e2eRegistry, "test-webserver", "1.0"}
+	StubDevicePlugin   = ImageConfig{e2eRegistry, "stub-device-plugin", "1.0"}
 )
 
 func GetE2EImage(image ImageConfig) string {
