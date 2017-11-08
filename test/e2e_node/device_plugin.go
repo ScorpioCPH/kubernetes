@@ -17,10 +17,7 @@ limitations under the License.
 package e2e_node
 
 import (
-	"fmt"
-	"os"
-	"path"
-	"path/filepath"
+	"strings"
 	"time"
 
 	"k8s.io/api/core/v1"
@@ -55,7 +52,7 @@ var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [D
 
 		BeforeEach(func() {
 			By("Create dummy device files on the node")
-			if err := createDummyDeviceFile(); err != nil {
+			if err := framework.CreateDummyDeviceFileFromConfig(); err != nil {
 				Skip("Faild to create dummy device files. Skipping test.")
 			}
 
@@ -131,44 +128,10 @@ var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [D
 	})
 })
 
-func createDummyDeviceFile() error {
-	// clean up if needed
-	dir := path.Join(os.TempDir(), dummyDeviceDir)
-	err := os.RemoveAll(dir)
-	checkError(err)
-
-	err = os.MkdirAll(dir, os.ModePerm)
-	checkError(err)
-
-	// create dummy device file 1 with healthy state
-	f1, err := os.Create(filepath.Join(dir, "device-1"))
-	defer f1.Close()
-	checkError(err)
-
-	_, err = f1.WriteString(pluginapi.Healthy)
-	checkError(err)
-
-	// create dummy device file 2 with unhealthy state
-	f2, err := os.Create(filepath.Join(dir, "device-2"))
-	defer f2.Close()
-	checkError(err)
-
-	_, err = f2.WriteString(pluginapi.Unhealthy)
-	checkError(err)
-
-	return nil
-}
-
-func checkError(err error) {
-	if err != nil {
-		errStr := fmt.Sprintf("Error: %+v\n", err)
-		Skip(errStr)
-	}
-}
-
 func makeStubPauseImage() *v1.Pod {
-	podName := "stub-device-plugin-test-" + string(uuid.NewUUID())
+	podName := "device-plugin-test-" + string(uuid.NewUUID())
 	privileged := true
+	subdir := strings.Replace(framework.ResourceName, "/", "-", -1)
 
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: podName},
@@ -178,10 +141,10 @@ func makeStubPauseImage() *v1.Pod {
 				Image: busyboxImage,
 				Name:  podName,
 				// Retrieves the stub devices created in the test pod.
-				Command: []string{"sh", "-c", "devs=$(ls /tmp/" + dummyDeviceDir + " | egrep '^device-[0-9]+$') && echo stub devices: $devs"},
+				Command: []string{"sh", "-c", "devs=$(ls /tmp/" + framework.DummyDeviceDir + "/" + subdir + " | egrep '^device-[0-9]+$') && echo stub devices: $devs"},
 				Resources: v1.ResourceRequirements{
-					Limits:   newDecimalResourceList(framework.StubDeviceName, 1),
-					Requests: newDecimalResourceList(framework.StubDeviceName, 1),
+					Limits:   newDecimalResourceList(v1.ResourceName(framework.ResourceName), 1),
+					Requests: newDecimalResourceList(v1.ResourceName(framework.ResourceName), 1),
 				},
 				SecurityContext: &v1.SecurityContext{
 					Privileged: &privileged,
