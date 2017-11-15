@@ -10,6 +10,7 @@ go_library(
     name = "go_default_library",
     srcs = [
         "container.go",
+        "device_plugin.go",
         "doc.go",
         "docker_util.go",
         "gpu_device_plugin.go",
@@ -31,6 +32,7 @@ go_library(
         "//pkg/features:go_default_library",
         "//pkg/kubelet/apis/cri:go_default_library",
         "//pkg/kubelet/apis/cri/v1alpha1/runtime:go_default_library",
+        "//pkg/kubelet/apis/deviceplugin/v1alpha:go_default_library",
         "//pkg/kubelet/apis/kubeletconfig:go_default_library",
         "//pkg/kubelet/apis/kubeletconfig/scheme:go_default_library",
         "//pkg/kubelet/apis/kubeletconfig/v1alpha1:go_default_library",

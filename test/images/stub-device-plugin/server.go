@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://wws.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,15 +19,17 @@ package main
 import (
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/golang/glog"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 
@@ -39,7 +41,11 @@ const (
 	dummyDeviceRE string = "^device-[0-9]*$"
 )
 
+// StubDevicePlugin contains grpc info and devices info
 type StubDevicePlugin struct {
+	// basic info
+	resourceName string
+
 	// grpc info
 	endpoint   string
 	grpcServer *grpc.Server
@@ -51,6 +57,9 @@ type StubDevicePlugin struct {
 	// dummy device file watcher
 	watcher     utilfs.FSWatcher
 	watcherPath string
+
+	// internal chan
+	updateChan chan bool
 }
 
 func getDevices(dir string) map[string]pluginapi.Device {
@@ -70,40 +79,49 @@ func getDevices(dir string) map[string]pluginapi.Device {
 
 		// match dummyDeviceRE
 		if reg.MatchString(f.Name()) {
-			log.Printf("found dummy device %q\n", f.Name())
+			glog.Infof("found dummy device: %s", f.Name())
+
+			// we use file name as device id
+			id := f.Name()
+
+			// read device state from file
+			state, err := ioutil.ReadFile(filepath.Join(dir, f.Name()))
+			if err != nil {
+				continue
+			}
+
 			devices[f.Name()] = pluginapi.Device{
-				ID: f.Name(),
-				// TODO(cph): read device state from dummy file
-				Health: pluginapi.Healthy,
+				ID:     id,
+				Health: strings.Replace(string(state), "\n", "", -1),
 			}
 		}
 	}
 
-	log.Printf("getDevices: %+v\n", devices)
+	glog.Infof("getDevices: %v", devices)
 	return devices
 }
 
 // NewStubDevicePlugin returns an initialized StubDevicePlugin.
-func NewStubDevicePlugin(endpoint, dir string) (*StubDevicePlugin, error) {
+func NewStubDevicePlugin(endpoint, dir, resourceName string) (*StubDevicePlugin, error) {
 	devices := getDevices(dir)
 	if len(devices) == 0 {
-		return nil, fmt.Errorf("No devices found in dir: %s, exit.", dir)
+		return nil, fmt.Errorf("No devices found in dir: %s", dir)
 	}
 
-	log.Printf("NewStubDevicePlugin, endpoint: %s, dir: %s", endpoint, dir)
+	glog.Infof("NewStubDevicePlugin, endpoint: %s, dir: %s", endpoint, dir)
 	return &StubDevicePlugin{
-		endpoint: endpoint + fmt.Sprintf("-%d", time.Now().Unix()),
-
-		devices: devices,
-
-		watcher:     utilfs.NewFsnotifyWatcher(),
-		watcherPath: dir,
+		resourceName: resourceName,
+		endpoint:     endpoint + fmt.Sprintf("-%d", time.Now().Unix()),
+		devices:      devices,
+		watcher:      utilfs.NewFsnotifyWatcher(),
+		watcherPath:  dir,
+		updateChan:   make(chan bool),
 	}, nil
 }
 
-// Register registers the device plugin for the given resourceName with Kubelet.
-func (s *StubDevicePlugin) Register(kubeletEndpoint, resourceName string) error {
-	conn, err := grpc.Dial(kubeletEndpoint, grpc.WithInsecure(),
+// Register registers the device plugin to Kubelet.
+func (s *StubDevicePlugin) Register(kubeletEndpoint string) error {
+	conn, err := grpc.Dial(kubeletEndpoint, grpc.WithInsecure(), grpc.WithBlock(),
 		grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout("unix", addr, timeout)
 		}))
@@ -115,7 +133,7 @@ func (s *StubDevicePlugin) Register(kubeletEndpoint, resourceName string) error 
 	reqt := &pluginapi.RegisterRequest{
 		Version:      pluginapi.Version,
 		Endpoint:     path.Base(s.endpoint),
-		ResourceName: resourceName,
+		ResourceName: s.resourceName,
 	}
 
 	_, err = client.Register(context.Background(), reqt)
@@ -127,20 +145,42 @@ func (s *StubDevicePlugin) Register(kubeletEndpoint, resourceName string) error 
 
 // ListAndWatch lists devices and update that list according to the Update call
 func (s *StubDevicePlugin) ListAndWatch(emtpy *pluginapi.Empty, server pluginapi.DevicePlugin_ListAndWatchServer) error {
-	for {
-		resp := new(pluginapi.ListAndWatchResponse)
-		for _, dev := range s.devices {
-			resp.Devices = append(resp.Devices, &pluginapi.Device{dev.ID, dev.Health})
-		}
-		log.Printf("ListAndWatch: send devices %v", resp)
-
-		if err := server.Send(resp); err != nil {
-			log.Printf("device-plugin: cannot update device states: %v\n", err)
-			return err
-		}
-
-		time.Sleep(5 * time.Second)
+	if err := s.sendDevicesToKubelet(server); err != nil {
+		glog.Errorf("device-plugin: cannot update device states: %v", err)
+		return err
 	}
+
+	for {
+		select {
+		case needUpdate := <-s.updateChan:
+			if !needUpdate {
+				continue
+			}
+
+			if err := s.sendDevicesToKubelet(server); err != nil {
+				glog.Errorf("device-plugin: cannot update device states: %v", err)
+				return err
+			}
+		}
+	}
+
+}
+
+func (s *StubDevicePlugin) sendDevicesToKubelet(server pluginapi.DevicePlugin_ListAndWatchServer) error {
+	resp := new(pluginapi.ListAndWatchResponse)
+	for _, dev := range s.devices {
+		resp.Devices = append(resp.Devices, &pluginapi.Device{
+			ID:     dev.ID,
+			Health: dev.Health,
+		})
+	}
+
+	if err := server.Send(resp); err != nil {
+		return fmt.Errorf("device-plugin: cannot update device states: %v", err)
+	}
+
+	glog.Infof("send devices: %v", resp)
+	return nil
 }
 
 // Allocate which return list of devices.
@@ -167,13 +207,14 @@ func (s *StubDevicePlugin) Allocate(ctx context.Context, r *pluginapi.AllocateRe
 		})
 	}
 
-	log.Printf("Allocate response: %+v", response)
+	glog.Infof("Allocate response: %v", response)
 	return &response, nil
 }
 
+// Start will start grpc server and register to kubelet
 func (s *StubDevicePlugin) Start() error {
 	// Start grpc server
-	log.Printf("StubDevicePlugin start at: %s", s.endpoint)
+	glog.Infof("StubDevicePlugin start at: %s", s.endpoint)
 	err := s.cleanup()
 	if err != nil {
 		return err
@@ -191,12 +232,8 @@ func (s *StubDevicePlugin) Start() error {
 
 	// Wait till the grpcServer is ready to serve services.
 	for {
-		s.mutex.Lock()
-		server := s.grpcServer
-		s.mutex.Unlock()
-
-		if server != nil {
-			services := server.GetServiceInfo()
+		if s.grpcServer != nil {
+			services := s.grpcServer.GetServiceInfo()
 			if len(services) > 0 {
 				break
 			}
@@ -206,16 +243,16 @@ func (s *StubDevicePlugin) Start() error {
 	}
 
 	// Register to kubelet
-	err = s.Register(pluginapi.KubeletSocket, resourceName)
+	err = s.Register(pluginapi.KubeletSocket)
 	if err != nil {
-		log.Printf("Could not register device plugin: %s", err)
+		glog.Infof("Could not register device plugin: %s", err)
 		s.Stop()
 		return err
 	}
 
-	log.Printf("Registered device plugin with Kubelet")
+	glog.Info("Registered device plugin with Kubelet")
 
-	// start dummy device file
+	// start watcher for dummy device file
 	s.startWatcher()
 
 	return nil
@@ -223,7 +260,7 @@ func (s *StubDevicePlugin) Start() error {
 
 // Stop stops the gRPC server
 func (s *StubDevicePlugin) Stop() error {
-	log.Printf("StubDevicePlugin.Stop()\n")
+	glog.Info("StubDevicePlugin.Stop()")
 	if s.grpcServer == nil {
 		return nil
 	}
@@ -247,20 +284,20 @@ func (s *StubDevicePlugin) startWatcher() error {
 	err := s.watcher.Init(func(event fsnotify.Event) {
 		// Event hander function
 		if err := s.handleWatchEvent(event); err != nil {
-			log.Fatalf("StubDevicePlugin watch error: %s", err)
+			glog.Errorf("StubDevicePlugin watch error: %v", err)
 		}
 	}, func(err error) {
 		// TODO(cph): implement error handler
-		log.Fatalf("Received an error from watcher: %s", err)
+		glog.Errorf("Received an error from watcher: %v", err)
 	})
 
 	if err != nil {
-		return fmt.Errorf("Error initializing watcher: %s", err)
+		glog.Fatalf("Error initializing watcher: %v", err)
 	}
 
 	// add watch path
 	if err := s.watcher.AddWatch(s.watcherPath); err != nil {
-		log.Fatalf("Error adding watch path(%s): %v", err, s.watcherPath)
+		glog.Fatalf("Error adding watch path(%s): %v", s.watcherPath, err)
 	}
 
 	// start watcher
@@ -282,29 +319,49 @@ func (s *StubDevicePlugin) handleWatchEvent(event fsnotify.Event) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	needUpdate := false
 	// create new device
 	if event.Op&fsnotify.Create == fsnotify.Create {
-		log.Printf("handleWatchEvent...Create")
-		s.devices[f] = pluginapi.Device{
-			ID: f,
-			// TODO(cph): read device state from dummy file
-			Health: pluginapi.Healthy,
+		glog.Info("handleWatchEvent...Create")
+
+		// read device state from file
+		state, err := ioutil.ReadFile(filepath.Join(s.watcherPath, f))
+		if err != nil {
+			// ignore read error
+			return nil
 		}
-		return nil
+
+		// add new device
+		s.devices[f] = pluginapi.Device{
+			ID:     f,
+			Health: strings.Replace(string(state), "\n", "", -1),
+		}
+		needUpdate = true
 	} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-		log.Printf("handleWatchEvent...Remove")
+		glog.Info("handleWatchEvent...Remove")
 		// delete old device
 		delete(s.devices, f)
-		return nil
+		needUpdate = true
 	} else if event.Op&fsnotify.Write == fsnotify.Write {
-		log.Printf("handleWatchEvent...Write")
+		glog.Info("handleWatchEvent...Write")
+
+		// read device state from file
+		state, err := ioutil.ReadFile(filepath.Join(s.watcherPath, f))
+		if err != nil {
+			// ignore read error
+			return nil
+		}
+
 		// update old device
 		s.devices[f] = pluginapi.Device{
-			ID: f,
-			// TODO(cph): read device state from dummy file
-			Health: pluginapi.Healthy,
+			ID:     f,
+			Health: strings.Replace(string(state), "\n", "", -1),
 		}
-		return nil
+		needUpdate = true
+	}
+
+	if needUpdate {
+		s.updateChan <- needUpdate
 	}
 
 	return nil

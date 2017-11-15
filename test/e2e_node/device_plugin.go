@@ -38,7 +38,13 @@ const (
 	// e.g. "/tmp/dummy-device/device-1", "/tmp/dummy-device/device-2"
 	dummyDeviceDir string = "dummy-device"
 	dummyDeviceRE  string = "^device-[0-9]*$"
+
+	// in this test, we expected there are numberOfStubDevices devices existed
+	numberOfStubDevices int64 = 2
 )
+
+var resourceName string
+var resourcePath string
 
 // Serial because the test restarts Kubelet
 var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [Disruptive]", func() {
@@ -52,22 +58,32 @@ var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [D
 
 		BeforeEach(func() {
 			By("Create dummy device files on the node")
-			if err := framework.CreateDummyDeviceFileFromConfig(); err != nil {
-				Skip("Faild to create dummy device files. Skipping test.")
+			resources, err := framework.CreateDummyDeviceFileFromConfig()
+
+			if err != nil || len(resources) == 0 {
+				Skip("Failed to create dummy device files. Skipping test.")
 			}
 
-			By("Creating stub device plugin pod")
-			f.PodClient().CreateSync(framework.StubDevicePlugin(f.Namespace.Name))
+			// TODO(cph): for now use the first resource
+			// we can simulate more resources registration scenario by extending this
+			resourceName = resources[0].ResourceName
+			resourcePath = resources[0].ResourcePath
 
-			// TODO(cph): remove sleep here will break test
-			time.Sleep(30 * time.Second)
+			By("Creating stub device plugin pod")
+			f.PodClient().CreateSync(framework.StubDevicePlugin(f.Namespace.Name, resourcePath))
+
+			By("Wait for node is ready")
+			Eventually(func() int {
+				nodeList := framework.GetReadySchedulableNodesOrDie(f.ClientSet)
+				return len(nodeList.Items)
+			}, 30*time.Second, framework.Poll).Should(Equal(1))
 
 			By("Waiting for stub device to become available on the local node")
 			Eventually(func() bool {
-				return framework.NumberOfStubDevices(getLocalNode(f)) > 0
-			}, 10*time.Second, framework.Poll).Should(BeTrue())
+				return framework.NumberOfStubDevices(getLocalNode(f), resourceName) > 0
+			}, 30*time.Second, framework.Poll).Should(BeTrue())
 
-			if framework.NumberOfStubDevices(getLocalNode(f)) < 2 {
+			if framework.NumberOfStubDevices(getLocalNode(f), resourceName) < numberOfStubDevices {
 				Skip("Not enough dummy device to execute this test (at least two needed)")
 			}
 		})
@@ -87,34 +103,37 @@ var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [D
 
 		It("Checks that when Kubelet restarts exclusive dummy-device assignation to pods is kept.", func() {
 			By("Creating one dummy-device pod on a node with at least two dummy-devices")
-			p1 := f.PodClient().CreateSync(makeStubPauseImage())
+			p1 := f.PodClient().CreateSync(makeStubPauseImage(resourceName))
 			deviceRE := "stub devices: (device-[0-9]+)"
-			devId1 := getDeviceIdWithRE(f, p1.Name, p1.Name, 0, deviceRE)
+			devId1 := framework.GetDeviceIdWithRE(f, p1.Name, p1.Name, 0, deviceRE)
 			Expect(devId1).To(Not(Equal("")))
 			p1, err := f.PodClient().Get(p1.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 
 			By("Restarting Kubelet and waiting for the current running pod to restart")
 			socketRE := pluginapi.DevicePluginPath + "stub.sock-*"
-			restartKubeletWithSocketRE(f, socketRE)
+			framework.RestartKubeletWithSocketRE(socketRE)
 
-			// TODO(cph): remove sleep here will break test
-			time.Sleep(30 * time.Second)
+			By("Wait for node is ready")
+			Eventually(func() int {
+				nodeList := framework.GetReadySchedulableNodesOrDie(f.ClientSet)
+				return len(nodeList.Items)
+			}, 30*time.Second, framework.Poll).Should(Equal(1))
 
 			By("Confirming that after a kubelet and pod restart, dummy-device assignement is kept")
-			devIdRestart := getDeviceIdWithRE(f, p1.Name, p1.Name, 1, deviceRE)
+			devIdRestart := framework.GetDeviceIdWithRE(f, p1.Name, p1.Name, 1, deviceRE)
 			Expect(devIdRestart).To(Equal(devId1))
 
 			By("Restarting Kubelet and creating another pod")
-			restartKubeletWithSocketRE(f, socketRE)
+			framework.RestartKubeletWithSocketRE(socketRE)
 
 			// TODO(cph): remove sleep here will break test
 			time.Sleep(30 * time.Second)
 
-			p2 := f.PodClient().CreateSync(makeStubPauseImage())
+			p2 := f.PodClient().CreateSync(makeStubPauseImage(resourceName))
 
 			By("Checking that pods got a different dummy-device")
-			devId2 := getDeviceIdWithRE(f, p2.Name, p2.Name, 0, deviceRE)
+			devId2 := framework.GetDeviceIdWithRE(f, p2.Name, p2.Name, 0, deviceRE)
 			p2, err = f.PodClient().Get(p2.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 
@@ -128,10 +147,10 @@ var _ = framework.KubeDescribe("Device Plugin [Feature:DevicePlugin] [Serial] [D
 	})
 })
 
-func makeStubPauseImage() *v1.Pod {
+func makeStubPauseImage(resourceName string) *v1.Pod {
 	podName := "device-plugin-test-" + string(uuid.NewUUID())
 	privileged := true
-	subdir := strings.Replace(framework.ResourceName, "/", "-", -1)
+	subdir := strings.Replace(resourceName, "/", "-", -1)
 
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: podName},
@@ -143,8 +162,8 @@ func makeStubPauseImage() *v1.Pod {
 				// Retrieves the stub devices created in the test pod.
 				Command: []string{"sh", "-c", "devs=$(ls /tmp/" + framework.DummyDeviceDir + "/" + subdir + " | egrep '^device-[0-9]+$') && echo stub devices: $devs"},
 				Resources: v1.ResourceRequirements{
-					Limits:   newDecimalResourceList(v1.ResourceName(framework.ResourceName), 1),
-					Requests: newDecimalResourceList(v1.ResourceName(framework.ResourceName), 1),
+					Limits:   framework.NewDecimalResourceList(v1.ResourceName(resourceName), 1),
+					Requests: framework.NewDecimalResourceList(v1.ResourceName(resourceName), 1),
 				},
 				SecurityContext: &v1.SecurityContext{
 					Privileged: &privileged,

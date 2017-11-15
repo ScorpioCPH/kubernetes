@@ -1,0 +1,19 @@
+{
+	"items":[
+		{
+			"resourceName":"resource.name/1",
+			"devices":[
+				{"ID":"device-1","health":"Healthy"},
+				{"ID":"device-2","health":"Healthy"}
+			]
+		},
+		{
+			"resourceName":"resource.name/2",
+			"devices":[
+				{"ID":"device-1","health":"Healthy"},
+				{"ID":"device-2","health":"Healthy"},
+				{"ID":"device-3","health":"Unhealthy"}
+			]
+		}
+	]
+}

@@ -18,38 +18,63 @@ package main
 
 import (
 	"flag"
-	"log"
 	"os"
 	"os/signal"
 	"path"
+	"strings"
 	"syscall"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/golang/glog"
 	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 )
 
 var (
-	resourceName   = ""
-	endpointPath   = ""
-	dummyDeviceDir = ""
+	resourcePath = ""
+	endpointPath = ""
 )
 
 func init() {
 	defaultEndpointPath := pluginapi.DevicePluginPath + "stub.sock"
-	flag.StringVar(&resourceName, "resource_name", "dummy.device.com/device", "Dummy device resource name to be advertised to Kubelet")
-	flag.StringVar(&endpointPath, "endpoint_path", defaultEndpointPath, "Path to stub device plugin grpc endpoint")
-	flag.StringVar(&dummyDeviceDir, "dummy_device_dir", "dummy-device", "Path to read dummy device file from")
+	flag.StringVar(&resourcePath, "resource-path", "dummy-device/resource.name-1", "Path to read resource name and dummy device file from")
+	flag.StringVar(&endpointPath, "endpoint-path", defaultEndpointPath, "Path to stub device plugin grpc endpoint")
+}
+
+// dummy device directory looks like this:
+// |-- tmp
+//     |-- dummy-device
+//         |-- resource.name-1  # hacky here, replace "-" with "/" to follow kubernetes resource naming convention
+//             |-- device-1 (content: Healthy)
+//             |-- device-2 (content: Unhealthy)
+//         |-- resource.name-2
+//             |-- device-1 (content: Healthy)
+//             |-- device-2 (content: Healthy)
+//             |-- device-3 (content: Unhealthy)
+//         |-- resource.name-3
+//             |-- device-1 (content: Healthy)
+//             |-- device-2 (content: Healthy)
+func createStubDevicePluginOrDie() *StubDevicePlugin {
+	// get resource name from resourcePath
+	// e.g. resourcePath is dummy-device/resource.name-1
+	// get resourceName resource.name/1
+	_, subDir := path.Split(resourcePath)
+	// TODO(cph): hacky here, replace "-" with "/" to follow kubernetes resource naming convention
+	resourceName := strings.Replace(subDir, "-", "/", -1)
+
+	// create new stub device plugin with endpoint and resource device path
+	resourceDevicePath := path.Join(os.TempDir(), resourcePath)
+	stubDevicePlugin, err := NewStubDevicePlugin(endpointPath, resourceDevicePath, resourceName)
+	if err != nil {
+		glog.Fatalf("Failed to create stub device plugin: %v", err)
+	}
+
+	return stubDevicePlugin
 }
 
 func main() {
 	flag.Parse()
 
-	// create new stub device plugin with endpoint and tmp dir
-	dir := path.Join(os.TempDir(), dummyDeviceDir)
-	stubDevicePlugin, err := NewStubDevicePlugin(endpointPath, dir)
-	if err != nil {
-		log.Panicln("Fatal to create stub device plugin:", err)
-	}
+	stubDevicePlugin := createStubDevicePluginOrDie()
 
 	// start serving
 	stubDevicePlugin.Start()
@@ -57,13 +82,13 @@ func main() {
 	// watcher for Kubelet
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Panicln("Fatal:", err)
+		glog.Fatal(err)
 	}
 
 	defer watcher.Close()
 	err = watcher.Add(pluginapi.DevicePluginPath)
 	if err != nil {
-		log.Panicln("Fatal:", err)
+		glog.Fatal(err)
 	}
 
 	sigs := make(chan os.Signal, 1)
@@ -78,31 +103,27 @@ L:
 			if event.Name == pluginapi.KubeletSocket &&
 				(event.Op&fsnotify.Create == fsnotify.Create ||
 					event.Op&fsnotify.Write == fsnotify.Write) {
-				log.Printf("inotify: %s changed, restarting", pluginapi.KubeletSocket)
+				glog.Infof("inotify: %s changed, restarting", pluginapi.KubeletSocket)
 				restart = true
 			}
 		case err := <-watcher.Errors:
-			log.Printf("inotify: %s", err)
+			glog.Infof("inotify: %s", err)
 		// system sigs
 		case s := <-sigs:
 			switch s {
 			case syscall.SIGHUP:
-				log.Println("Received SIGHUP, restarting")
+				glog.Info("Received SIGHUP, restarting")
 				restart = true
 			default:
-				log.Printf("Received signal %d, shutting down", s)
+				glog.Infof("Received signal: %d, shutting down", s)
 				stubDevicePlugin.Stop()
 				break L
 			}
 		}
 		if restart {
-			log.Println("restarting...")
+			glog.Info("restarting...")
 			stubDevicePlugin.Stop()
-			stubDevicePlugin, err = NewStubDevicePlugin(endpointPath, dir)
-			if err != nil {
-				log.Panicln("Fatal to create stub device plugin:", err)
-			}
-
+			stubDevicePlugin = createStubDevicePluginOrDie()
 			stubDevicePlugin.Start()
 		}
 	}

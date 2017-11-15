@@ -17,13 +17,9 @@ limitations under the License.
 package e2e_node
 
 import (
-	"os/exec"
-	"path/filepath"
-	"regexp"
 	"time"
 
 	"k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/kubernetes/pkg/features"
@@ -85,24 +81,24 @@ var _ = framework.KubeDescribe("NVIDIA GPU Device Plugin [Feature:GPUDevicePlugi
 			By("Creating one GPU pod on a node with at least two GPUs")
 			p1 := f.PodClient().CreateSync(makeCudaPauseImage())
 			deviceRE := "gpu devices: (nvidia[0-9]+)"
-			devId1 := getDeviceIdWithRE(f, p1.Name, p1.Name, 1, deviceRE)
+			devId1 := framework.GetDeviceIdWithRE(f, p1.Name, p1.Name, 1, deviceRE)
 			p1, err := f.PodClient().Get(p1.Name, metav1.GetOptions{})
 			framework.ExpectNoError(err)
 
 			By("Restarting Kubelet and waiting for the current running pod to restart")
 			socketRE := "/var/lib/kubelet/device-plugins/nvidiaGPU*.sock"
-			restartKubeletWithSocketRE(f, socketRE)
+			framework.RestartKubeletWithSocketRE(socketRE)
 
 			By("Confirming that after a kubelet and pod restart, GPU assignement is kept")
-			devIdRestart := getDeviceIdWithRE(f, p1.Name, p1.Name, 2, deviceRE)
+			devIdRestart := framework.GetDeviceIdWithRE(f, p1.Name, p1.Name, 2, deviceRE)
 			Expect(devIdRestart).To(Equal(devId1))
 
 			By("Restarting Kubelet and creating another pod")
-			restartKubeletWithSocketRE(f, socketRE)
+			framework.RestartKubeletWithSocketRE(socketRE)
 			p2 := f.PodClient().CreateSync(makeCudaPauseImage())
 
 			By("Checking that pods got a different GPU")
-			devId2 := getDeviceIdWithRE(f, p2.Name, p2.Name, 1, deviceRE)
+			devId2 := framework.GetDeviceIdWithRE(f, p2.Name, p2.Name, 1, deviceRE)
 			Expect(devId1).To(Not(Equal(devId2)))
 
 			// Cleanup
@@ -128,55 +124,10 @@ func makeCudaPauseImage() *v1.Pod {
 				Command: []string{"sh", "-c", "devs=$(ls /dev/ | egrep '^nvidia[0-9]+$') && echo gpu devices: $devs"},
 
 				Resources: v1.ResourceRequirements{
-					Limits:   newDecimalResourceList(framework.NVIDIAGPUResourceName, 1),
-					Requests: newDecimalResourceList(framework.NVIDIAGPUResourceName, 1),
+					Limits:   framework.NewDecimalResourceList(framework.NVIDIAGPUResourceName, 1),
+					Requests: framework.NewDecimalResourceList(framework.NVIDIAGPUResourceName, 1),
 				},
 			}},
 		},
 	}
-}
-
-func newDecimalResourceList(name v1.ResourceName, quantity int64) v1.ResourceList {
-	return v1.ResourceList{name: *resource.NewQuantity(quantity, resource.DecimalSI)}
-}
-
-// TODO: Find a uniform way to deal with systemctl/initctl/service operations. #34494
-func restartKubeletWithSocketRE(f *framework.Framework, re string) {
-	beforeSocks, err := filepath.Glob(re)
-	framework.ExpectNoError(err)
-	Expect(len(beforeSocks)).NotTo(BeZero())
-	stdout, err := exec.Command("sudo", "systemctl", "list-units", "kubelet*", "--state=running").CombinedOutput()
-	framework.ExpectNoError(err)
-	regex := regexp.MustCompile("(kubelet-[0-9]+)")
-	matches := regex.FindStringSubmatch(string(stdout))
-	Expect(len(matches)).NotTo(BeZero())
-	kube := matches[0]
-	framework.Logf("Get running kubelet with systemctl: %v, %v", string(stdout), kube)
-	stdout, err = exec.Command("sudo", "systemctl", "restart", kube).CombinedOutput()
-	framework.ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
-	Eventually(func() ([]string, error) {
-		return filepath.Glob(re)
-	}, 5*time.Minute, framework.Poll).ShouldNot(ConsistOf(beforeSocks))
-}
-
-func getDeviceIdWithRE(f *framework.Framework, podName string, contName string, restartCount int32, re string) string {
-	// Wait till pod has been restarted at least restartCount times.
-	Eventually(func() bool {
-		p, err := f.PodClient().Get(podName, metav1.GetOptions{})
-		if err != nil || len(p.Status.ContainerStatuses) < 1 {
-			return false
-		}
-		return p.Status.ContainerStatuses[0].RestartCount >= restartCount
-	}, 5*time.Minute, framework.Poll).Should(BeTrue())
-	logs, err := framework.GetPodLogs(f.ClientSet, f.Namespace.Name, podName, contName)
-	if err != nil {
-		framework.Failf("GetPodLogs for pod %q failed: %v", podName, err)
-	}
-	framework.Logf("got pod logs: %v", logs)
-	regex := regexp.MustCompile(re)
-	matches := regex.FindStringSubmatch(logs)
-	if len(matches) < 2 {
-		return ""
-	}
-	return matches[1]
 }

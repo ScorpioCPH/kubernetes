@@ -20,16 +20,22 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 	"k8s.io/kubernetes/test/e2e_node/builder"
 	imageutils "k8s.io/kubernetes/test/utils/image"
+
+	. "github.com/onsi/gomega"
 )
 
 const (
@@ -39,13 +45,8 @@ const (
 	DummyDeviceRE  string = "^device-[0-9]*$"
 )
 
-var (
-	// Dummy device resource name to be advertised to Kubelet
-	ResourceName = "resource.name/1"
-)
-
-func NumberOfStubDevices(node *v1.Node) int64 {
-	val, ok := node.Status.Capacity[v1.ResourceName(ResourceName)]
+func NumberOfStubDevices(node *v1.Node, resourceName string) int64 {
+	val, ok := node.Status.Capacity[v1.ResourceName(resourceName)]
 
 	if !ok {
 		return 0
@@ -55,7 +56,7 @@ func NumberOfStubDevices(node *v1.Node) int64 {
 }
 
 // StubDevicePlugin returns the stub Device Plugin pod for conformance testing
-func StubDevicePlugin(ns string) *v1.Pod {
+func StubDevicePlugin(ns, resourcePath string) *v1.Pod {
 	p := &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "stub-device-plugin-" + string(uuid.NewUUID()),
@@ -83,7 +84,7 @@ func StubDevicePlugin(ns string) *v1.Pod {
 				{
 					Name:  "stub-device-plugin",
 					Image: imageutils.GetE2EImage(imageutils.StubDevicePlugin),
-					// Args:  []string{"-resource_name", ResourceName},
+					Args:  []string{"-resource-path", resourcePath},
 					VolumeMounts: []v1.VolumeMount{
 						{
 							Name:      "device-plugin-path",
@@ -102,18 +103,25 @@ func StubDevicePlugin(ns string) *v1.Pod {
 	return p
 }
 
-// DummyDevice represents the dummy devices details with resource name.
-type DummyDevice struct {
+// dummyDevice represents the dummy devices details with resource name.
+type dummyDevice struct {
 	ResourceName string             `json:"resourceName,omitempty"`
 	Devices      []pluginapi.Device `json:"devices,omitempty"`
 }
 
-// DummyDeviceList is a list of DummyDevice objects.
-type DummyDeviceList struct {
-	Items []DummyDevice `json:"items,omitempty"`
+// dummyDeviceList is a list of dummyDevice objects.
+type dummyDeviceList struct {
+	Items []dummyDevice `json:"items,omitempty"`
+}
+
+// DummyResource represents the dummy resource details
+type DummyResource struct {
+	ResourceName string `json:"resourceName,omitempty"`
+	ResourcePath string `json:"resourcePath,omitempty"`
 }
 
 // CreateDummyDeviceFileFromConfig reads config file and parse it to create dummy device files on node
+// return array of DummyResource
 // dummy device directory looks like this:
 // |-- tmp
 //     |-- dummy-device
@@ -127,95 +135,129 @@ type DummyDeviceList struct {
 //         |-- resource.name-3
 //             |-- device-1 (content: healthy)
 //             |-- device-2 (content: healthy)
-func CreateDummyDeviceFileFromConfig() error {
+func CreateDummyDeviceFileFromConfig() ([]*DummyResource, error) {
+	Logf("CreateDummyDeviceFileFromConfig")
 	// clean up dummy device dir if needed
 	dir := path.Join(os.TempDir(), DummyDeviceDir)
 	err := os.RemoveAll(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	// create dummy device dir
 	err = os.MkdirAll(dir, os.ModePerm)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	dummyDeviceList := readConfigFile()
+	// get dummy device list from config file
+	dummyDeviceList, err := readConfigFile()
+	if err != nil {
+		return nil, err
+	}
 
-	for i, item := range dummyDeviceList.Items {
-		if i == 0 {
-			// TODO(cph): only get the first resource name now,
-			// we can add more test by extending this
-			ResourceName = item.ResourceName
-		}
-
+	// returned resources map (resourceName:resourcePath)
+	resources := []*DummyResource{}
+	for _, item := range dummyDeviceList.Items {
 		// TODO(cph): hacky here, replace "/" with "-" to prevent the depth of the directory from increasing
 		// create subdir with resource name
-		subdir := path.Join(dir, strings.Replace(item.ResourceName, "/", "-", -1))
+		resourcePath := path.Join(DummyDeviceDir, strings.Replace(item.ResourceName, "/", "-", -1))
+		subdir := path.Join(os.TempDir(), resourcePath)
 		err = os.MkdirAll(subdir, os.ModePerm)
 		if err != nil {
-			return err
+			return nil, err
 		}
+
+		resources = append(resources, &DummyResource{
+			ResourceName: item.ResourceName,
+			ResourcePath: resourcePath,
+		})
 
 		for _, device := range item.Devices {
 			// create dummy device file with health state and resource name
 			f1, err := os.Create(filepath.Join(subdir, device.ID))
 			defer f1.Close()
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			_, err = f1.WriteString(device.Health)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 
 	}
 
-	return nil
+	return resources, nil
 }
 
-func readConfigFile() *DummyDeviceList {
-	// hardcode default dummy device list
-	dafaultList := DummyDeviceList{
-		Items: []DummyDevice{
-			{
-				Devices: []pluginapi.Device{
-					{
-						ID:     "device-1",
-						Health: pluginapi.Healthy,
-					},
-					{
-						ID:     "device-2",
-						Health: pluginapi.Healthy,
-					},
-				},
-				ResourceName: ResourceName,
-			},
-		},
-	}
-
+func readConfigFile() (*dummyDeviceList, error) {
 	// get k8s root dir
 	rootDir, err := builder.GetK8sRootDir()
 	if err != nil {
 		Logf("failed to locate kubernetes root directory: %v", err)
-		return &dafaultList
+		return nil, err
 	}
 
 	// read config file
 	file, err := ioutil.ReadFile(filepath.Join(rootDir, "/test/images/stub-device-plugin/config.json"))
 	if err != nil {
 		Logf("failed to read config file: %v", err)
-		return &dafaultList
+		return nil, err
 	}
 
-	var dummyDeviceList DummyDeviceList
-	err = json.Unmarshal(file, &dummyDeviceList)
+	var list dummyDeviceList
+	err = json.Unmarshal(file, &list)
 	if err != nil {
 		Logf("failed to unmarshal config file: %v\n", err)
-		return &dafaultList
+		return nil, err
 	}
 
-	return &dummyDeviceList
+	return &list, nil
+}
+
+func NewDecimalResourceList(name v1.ResourceName, quantity int64) v1.ResourceList {
+	return v1.ResourceList{name: *resource.NewQuantity(quantity, resource.DecimalSI)}
+}
+
+// TODO: Find a uniform way to deal with systemctl/initctl/service operations. #34494
+func RestartKubeletWithSocketRE(re string) {
+	beforeSocks, err := filepath.Glob(re)
+	ExpectNoError(err)
+	Expect(len(beforeSocks)).NotTo(BeZero())
+	stdout, err := exec.Command("sudo", "systemctl", "list-units", "kubelet*", "--state=running").CombinedOutput()
+	ExpectNoError(err)
+	regex := regexp.MustCompile("(kubelet-[0-9]+)")
+	matches := regex.FindStringSubmatch(string(stdout))
+	Expect(len(matches)).NotTo(BeZero())
+	kube := matches[0]
+	Logf("Get running kubelet with systemctl: %v, %v", string(stdout), kube)
+	stdout, err = exec.Command("sudo", "systemctl", "restart", kube).CombinedOutput()
+	ExpectNoError(err, "Failed to restart kubelet with systemctl: %v, %v", err, stdout)
+	Eventually(func() ([]string, error) {
+		return filepath.Glob(re)
+	}, 5*time.Minute, Poll).ShouldNot(ConsistOf(beforeSocks))
+}
+
+func GetDeviceIdWithRE(f *Framework, podName string, contName string, restartCount int32, re string) string {
+	// Wait till pod has been restarted at least restartCount times.
+	Eventually(func() bool {
+		p, err := f.PodClient().Get(podName, metav1.GetOptions{})
+		if err != nil || len(p.Status.ContainerStatuses) < 1 {
+			return false
+		}
+		return p.Status.ContainerStatuses[0].RestartCount >= restartCount
+	}, 5*time.Minute, Poll).Should(BeTrue())
+	logs, err := GetPodLogs(f.ClientSet, f.Namespace.Name, podName, contName)
+	if err != nil {
+		Failf("GetPodLogs for pod %q failed: %v", podName, err)
+	}
+	Logf("got pod logs: %v", logs)
+	regex := regexp.MustCompile(re)
+	matches := regex.FindStringSubmatch(logs)
+	if len(matches) < 2 {
+		return ""
+	}
+	return matches[1]
 }
