@@ -29,6 +29,11 @@ import (
 	pluginapi "k8s.io/kubernetes/pkg/kubelet/apis/deviceplugin/v1alpha"
 )
 
+const (
+	// listAndWatchRetry specifies how many times endpoint retries when ListAndWatch gRPC call failed.
+	listAndWatchRetry = 3
+)
+
 // endpoint maps to a single registered device plugin. It is responsible
 // for managing gRPC communications with the device plugin and caching
 // device states reported by the device plugin.
@@ -111,12 +116,25 @@ func (e *endpointImpl) run() {
 	}
 	e.mutex.Unlock()
 
+	// retry flag
+	recvRetries := 0
+
 	for {
 		response, err := stream.Recv()
 		if err != nil {
-			glog.Errorf(errListAndWatch, e.resourceName, err)
-			return
+			recvRetries++
+			// give some time (listAndWatchRetry * time.Second = 3 seconds)
+			// to wait for the device plugin client to come up
+			time.Sleep(time.Second)
+			if recvRetries > listAndWatchRetry {
+				glog.Errorf(errListAndWatch, e.resourceName, err)
+				return
+			}
+			continue
 		}
+
+		// reset retry flag
+		recvRetries = 0
 
 		devs := response.Devices
 		glog.V(2).Infof("State pushed for device plugin %s", e.resourceName)
