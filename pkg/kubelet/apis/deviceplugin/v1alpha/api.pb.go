@@ -106,7 +106,7 @@ func (*Empty) ProtoMessage()               {}
 func (*Empty) Descriptor() ([]byte, []int) { return fileDescriptorApi, []int{1} }
 
 // ListAndWatch returns a stream of List of Devices
-// Whenever a Device state change or a Device disapears, ListAndWatch
+// Whenever a Device state change or a Device disappeared, ListAndWatch
 // returns the new list
 type ListAndWatchResponse struct {
 	Devices []*Device `protobuf:"bytes,1,rep,name=devices" json:"devices,omitempty"`
@@ -376,10 +376,9 @@ var _Registration_serviceDesc = grpc.ServiceDesc{
 }
 
 // Client API for DevicePlugin service
-
 type DevicePluginClient interface {
 	// ListAndWatch returns a stream of List of Devices
-	// Whenever a Device state change or a Device disapears, ListAndWatch
+	// Whenever a Device state change or a Device disappeared, ListAndWatch
 	// returns the new list
 	ListAndWatch(ctx context.Context, in *Empty, opts ...grpc.CallOption) (DevicePlugin_ListAndWatchClient, error)
 	// Allocate is called during container creation so that the Device
@@ -441,7 +440,7 @@ func (c *devicePluginClient) Allocate(ctx context.Context, in *AllocateRequest, 
 
 type DevicePluginServer interface {
 	// ListAndWatch returns a stream of List of Devices
-	// Whenever a Device state change or a Device disapears, ListAndWatch
+	// Whenever a Device state change or a Device disappeared, ListAndWatch
 	// returns the new list
 	ListAndWatch(*Empty, DevicePlugin_ListAndWatchServer) error
 	// Allocate is called during container creation so that the Device
